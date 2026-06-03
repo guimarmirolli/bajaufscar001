@@ -1,0 +1,291 @@
+#include <Arduino.h>
+#include "LoRa_E220.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#define ENABLE_RSSI true
+
+// E220 library exposes RSSI but not true LoRa demodulation SNR in receive API.
+// Keep this explicit as an estimate: SNR ~= RSSI - noise floor.
+static const int NOISE_FLOOR_DBM = -120;
+
+static uint32_t rxPktTot = 0;
+static uint32_t rxBytesTot = 0;
+static uint32_t parseErrTot = 0;
+static uint32_t dupTot = 0;
+static uint32_t lostTot = 0;
+static uint32_t lastSeq = 0;
+static bool hasSeq = false;
+static int8_t lastRSSI = 0;
+
+static bool parseU32Field(const char* payload, const char* key, uint32_t& out) {
+  const char* p = strstr(payload, key);
+  if (p == nullptr) {
+    return false;
+  }
+
+  p += strlen(key);
+  char* end = nullptr;
+  unsigned long v = strtoul(p, &end, 10);
+  if (end == p) {
+    return false;
+  }
+
+  out = (uint32_t)v;
+  return true;
+}
+
+static bool parseFloatField(const char* payload, const char* key, float& out) {
+  const char* p = strstr(payload, key);
+  if (p == nullptr) {
+    return false;
+  }
+
+  p += strlen(key);
+  char* end = nullptr;
+  float v = strtof(p, &end);
+  if (end == p) {
+    return false;
+  }
+
+  out = v;
+  return true;
+}
+
+static bool extractSysFrame(const String& raw, char* out, size_t outSize) {
+  if (out == nullptr || outSize < 8) {
+    return false;
+  }
+
+  size_t len = raw.length();
+  if (len == 0) {
+    return false;
+  }
+
+  int start = 0;
+  for (size_t i = 0; i + 3 < len; ++i) {
+    if (raw[i] == 'S' && raw[i + 1] == 'Y' && raw[i + 2] == 'S' && raw[i + 3] == ';') {
+      start = (int)i;
+      break;
+    }
+  }
+
+  size_t w = 0;
+  for (size_t i = (size_t)start; i < len && w < (outSize - 1); ++i) {
+    char c = raw[i];
+    if (c == '\0' || c == '\r' || c == '\n') {
+      break;
+    }
+
+    uint8_t uc = (uint8_t)c;
+    if (uc < 32 || uc > 126) {
+      continue;
+    }
+
+    out[w++] = c;
+  }
+
+  out[w] = '\0';
+  return (w > 0);
+}
+
+static bool parseSysPayload(const char* msg, uint32_t& seq, uint32_t& tms, float& temp, float& rpm, float& spd) {
+  if (msg == nullptr) {
+    return false;
+  }
+
+  if (strncmp(msg, "SYS;", 4) == 0) {
+    if (!parseU32Field(msg, "SEQ=", seq)) {
+      return false;
+    }
+    if (!parseU32Field(msg, "TMS=", tms)) {
+      return false;
+    }
+    if (!parseFloatField(msg, "T=", temp)) {
+      return false;
+    }
+    if (!parseFloatField(msg, "RPM=", rpm)) {
+      return false;
+    }
+    if (!parseFloatField(msg, "SPD=", spd)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // Compact payload format examples:
+  // %u;t=%u;T=%.1fC;RPM=%.0f;SPD=%.1f
+  // %u;T=%u;T=%.1f;RPM=%.0f;SPD=%.1f
+  char* seqEnd = nullptr;
+  unsigned long seqUl = strtoul(msg, &seqEnd, 10);
+  if (seqEnd != msg && *seqEnd == ';') {
+    seq = (uint32_t)seqUl;
+
+    bool gotTime = parseU32Field(msg, "t=", tms) || parseU32Field(msg, "TMS=", tms) || parseU32Field(msg, "T=", tms);
+    if (!gotTime) {
+      return false;
+    }
+    if (!parseFloatField(msg, "T=", temp)) {
+      return false;
+    }
+    if (!parseFloatField(msg, "RPM=", rpm)) {
+      return false;
+    }
+    if (!parseFloatField(msg, "SPD=", spd)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+static void hexPreview(const String& raw, char* out, size_t outSize, size_t maxBytes) {
+  if (out == nullptr || outSize == 0) {
+    return;
+  }
+
+  out[0] = '\0';
+  size_t len = raw.length();
+  size_t lim = (len < maxBytes) ? len : maxBytes;
+  size_t used = 0;
+
+  for (size_t i = 0; i < lim; ++i) {
+    char chunk[4];
+    snprintf(chunk, sizeof(chunk), "%02X", (uint8_t)raw[i]);
+
+    if (used + 2 >= outSize) {
+      break;
+    }
+
+    out[used++] = chunk[0];
+    out[used++] = chunk[1];
+
+    if (i + 1 < lim) {
+      if (used + 1 >= outSize) {
+        break;
+      }
+      out[used++] = ' ';
+    }
+  }
+
+  out[used] = '\0';
+}
+
+static int rssiToDbm(int8_t rawRssi) {
+  uint8_t raw = (uint8_t)rawRssi;
+  return (raw == 0) ? 0 : -(256 - raw);
+}
+
+static int estimateSnrDb(int rssiDbm) {
+  return rssiDbm - NOISE_FLOOR_DBM;
+}
+
+LoRa_E220 e220ttl(&Serial2, 36, 32, 33, UART_BPS_RATE_9600);
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial2.begin(9600, SERIAL_8N1, 16, 17);
+
+    e220ttl.begin();
+
+    ResponseStructContainer c = e220ttl.getConfiguration();
+    Configuration configuration = *(Configuration*) c.data;
+    Serial.print("RSSI enabled: ");
+    Serial.println(configuration.TRANSMISSION_MODE.enableRSSI);
+    c.close();
+
+    Serial.println("RX ready");
+}
+
+void loop() 
+{
+  if (e220ttl.available() > 0) 
+  {
+    ResponseContainer rc = ENABLE_RSSI ? e220ttl.receiveMessageRSSI() : e220ttl.receiveMessage();
+
+    if (rc.status.code == 1) 
+    {
+      rxPktTot++;
+      rxBytesTot += rc.data.length();
+
+      uint32_t now = millis();
+
+      if (ENABLE_RSSI) {
+        lastRSSI = rc.rssi;
+      }
+
+      char sysFrame[160];
+      uint32_t seq = 0;
+      uint32_t tms = 0;
+      float temp = 0.0f;
+      float rpm = 0.0f;
+      float spd = 0.0f;
+      bool parsed = extractSysFrame(rc.data, sysFrame, sizeof(sysFrame)) &&
+                    parseSysPayload(sysFrame, seq, tms, temp, rpm, spd);
+
+      if (parsed) {
+        int rssiDbm = rssiToDbm(lastRSSI);
+        int snrEstDb = estimateSnrDb(rssiDbm);
+
+        if (hasSeq) {
+          uint32_t delta = seq - lastSeq;
+          if (delta == 0) {
+            dupTot++;
+            Serial.printf("dup;%lu;seq=%lu;dup_tot=%lu\n",
+                          now,
+                          (unsigned long)seq,
+                          (unsigned long)dupTot);
+          } else if (delta > 1) {
+            uint32_t gap = delta - 1;
+            lostTot += gap;
+            Serial.printf("loss;%lu;prev_seq=%lu;seq=%lu;lost=%lu;lost_tot=%lu\n",
+                          now,
+                          (unsigned long)lastSeq,
+                          (unsigned long)seq,
+                          (unsigned long)gap,
+                          (unsigned long)lostTot);
+          }
+        }
+        hasSeq = true;
+        lastSeq = seq;
+
+        Serial.printf("RX;%lu;seq=%lu;tms=%lu;rssi_dbm=%d;snr_est_db=%d;len=%u;T=%.1f;RPM=%.0f;SPD=%.1f\n",
+                      now,
+                      (unsigned long)seq,
+                      (unsigned long)tms,
+                rssiDbm,
+                snrEstDb,
+                      rc.data.length(),
+                      temp,
+                      rpm,
+                      spd);
+      } else {
+        parseErrTot++;
+        char hex[80];
+        hexPreview(rc.data, hex, sizeof(hex), 20);
+        Serial.printf("parse_err;%lu;parse_err_tot=%lu;rssi_dbm=%d;len=%u;hex=%s\n",
+                      now,
+                      (unsigned long)parseErrTot,
+                      rssiToDbm(lastRSSI),
+                      rc.data.length(),
+                      hex);
+      }
+    }
+    else
+    {
+      Serial.printf("ERR;%lu;%s;rx_tot=%lu;bytes_tot=%lu;lost_tot=%lu;dup_tot=%lu;parse_err_tot=%lu\n",
+                    millis(),
+                    rc.status.getResponseDescription().c_str(),
+                    (unsigned long)rxPktTot,
+                    (unsigned long)rxBytesTot,
+                    (unsigned long)lostTot,
+                    (unsigned long)dupTot,
+                    (unsigned long)parseErrTot);
+    }
+  }
+}
